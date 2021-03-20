@@ -49,8 +49,6 @@ EKF2Selector::EKF2Selector() :
 EKF2Selector::~EKF2Selector()
 {
 	Stop();
-
-	px4_lockstep_unregister_component(_lockstep_component);
 }
 
 bool EKF2Selector::Start()
@@ -71,12 +69,12 @@ void EKF2Selector::Stop()
 
 bool EKF2Selector::SelectInstance(uint8_t ekf_instance)
 {
-	if (ekf_instance != _selected_instance) {
+	if ((ekf_instance != INVALID_INSTANCE) && (ekf_instance != _selected_instance)) {
 
 		// update sensor_selection immediately
 		sensor_selection_s sensor_selection{};
-		sensor_selection.accel_device_id = _instance[ekf_instance].estimator_status.accel_device_id;
-		sensor_selection.gyro_device_id = _instance[ekf_instance].estimator_status.gyro_device_id;
+		sensor_selection.accel_device_id = _instance[ekf_instance].accel_device_id;
+		sensor_selection.gyro_device_id = _instance[ekf_instance].gyro_device_id;
 		sensor_selection.timestamp = hrt_absolute_time();
 		_sensor_selection_pub.publish(sensor_selection);
 
@@ -86,7 +84,24 @@ bool EKF2Selector::SelectInstance(uint8_t ekf_instance)
 			_instance[_selected_instance].estimator_status_sub.unregisterCallback();
 
 			if (!_instance[_selected_instance].healthy) {
-				PX4_WARN("primary EKF changed %d (unhealthy) -> %d", _selected_instance, ekf_instance);
+				const char *reason = nullptr;
+
+				if (_instance[_selected_instance].filter_fault) {
+					reason = "filter fault";
+
+				} else if (_instance[_selected_instance].timeout) {
+					reason = "timeout";
+
+				} else if (_gyro_fault_detected) {
+					reason = "gyro fault";
+
+				} else if (_accel_fault_detected) {
+					reason = "accel fault";
+				}
+
+				if (reason) {
+					PX4_WARN("primary EKF changed %d (%s) -> %d", _selected_instance, reason, ekf_instance);
+				}
 			}
 		}
 
@@ -107,6 +122,7 @@ bool EKF2Selector::SelectInstance(uint8_t ekf_instance)
 		PublishVehicleAttitude(true);
 		PublishVehicleLocalPosition(true);
 		PublishVehicleGlobalPosition(true);
+		PublishWindEstimate(true);
 
 		return true;
 	}
@@ -221,13 +237,28 @@ bool EKF2Selector::UpdateErrorScores()
 	bool updated = false;
 	bool primary_updated = false;
 
+	// default estimator timeout
+	hrt_abstime status_timeout = 50_ms;
+
+	if (hrt_elapsed_time(&_attitude_last.timestamp) > FILTER_UPDATE_PERIOD) {
+		// much lower timeout if current primary estimator attitude isn't publishing
+		status_timeout = 2 * FILTER_UPDATE_PERIOD;
+	}
+
 	// calculate individual error scores
 	for (uint8_t i = 0; i < EKF2_MAX_INSTANCES; i++) {
 		const bool prev_healthy = _instance[i].healthy;
 
-		const estimator_status_s &status = _instance[i].estimator_status;
+		estimator_status_s status;
 
-		if (_instance[i].estimator_status_sub.update(&_instance[i].estimator_status)) {
+		if (_instance[i].estimator_status_sub.update(&status)) {
+
+			_instance[i].timestamp_sample_last = status.timestamp_sample;
+
+			_instance[i].accel_device_id = status.accel_device_id;
+			_instance[i].gyro_device_id = status.gyro_device_id;
+			_instance[i].baro_device_id = status.baro_device_id;
+			_instance[i].mag_device_id = status.mag_device_id;
 
 			if ((i + 1) > _available_instances) {
 				_available_instances = i + 1;
@@ -250,27 +281,31 @@ bool EKF2Selector::UpdateErrorScores()
 
 			_instance[i].combined_test_ratio = combined_test_ratio;
 			_instance[i].healthy = tilt_align && yaw_align && (status.filter_fault_flags == 0);
+			_instance[i].filter_fault = (status.filter_fault_flags != 0);
+			_instance[i].timeout = false;
 
 			if (!PX4_ISFINITE(_instance[i].relative_test_ratio)) {
 				_instance[i].relative_test_ratio = 0;
 			}
 
-		} else if (hrt_elapsed_time(&status.timestamp) > 20_ms) {
+		} else if (hrt_elapsed_time(&_instance[i].timestamp_sample_last) > status_timeout) {
 			_instance[i].healthy = false;
+			_instance[i].timeout = true;
 		}
 
 		// if the gyro used by the EKF is faulty, declare the EKF unhealthy without delay
-		if (_gyro_fault_detected && (faulty_gyro_id != 0) && (status.gyro_device_id == faulty_gyro_id)) {
+		if (_gyro_fault_detected && (faulty_gyro_id != 0) && (_instance[i].gyro_device_id == faulty_gyro_id)) {
 			_instance[i].healthy = false;
 		}
 
 		// if the accelerometer used by the EKF is faulty, declare the EKF unhealthy without delay
-		if (_accel_fault_detected && (faulty_accel_id != 0) && (status.accel_device_id == faulty_accel_id)) {
+		if (_accel_fault_detected && (faulty_accel_id != 0) && (_instance[i].accel_device_id == faulty_accel_id)) {
 			_instance[i].healthy = false;
 		}
 
 		if (prev_healthy != _instance[i].healthy) {
 			updated = true;
+			_selector_status_publish = true;
 		}
 	}
 
@@ -327,10 +362,7 @@ void EKF2Selector::PublishVehicleAttitude(bool reset)
 		attitude.timestamp = hrt_absolute_time();
 		_vehicle_attitude_pub.publish(attitude);
 
-		// register lockstep component on first attitude publish
-		if (_lockstep_component == -1) {
-			_lockstep_component = px4_lockstep_register_component();
-		}
+		_instance[_selected_instance].timestamp_sample_last = attitude.timestamp_sample;
 	}
 }
 
@@ -381,7 +413,7 @@ void EKF2Selector::PublishVehicleLocalPosition(bool reset)
 			// VZ reset
 			if (local_position.vz_reset_counter > _local_position_last.vz_reset_counter) {
 				++_vz_reset_counter;
-				_delta_z_reset = local_position.delta_vz;
+				_delta_vz_reset = local_position.delta_vz;
 			}
 
 			// heading reset
@@ -395,7 +427,7 @@ void EKF2Selector::PublishVehicleLocalPosition(bool reset)
 		_local_position_last = local_position;
 
 		// publish estimator's local position for system (vehicle_local_position) unless it's stale
-		if (local_position.timestamp >= _instance[_selected_instance].estimator_status.timestamp_sample) {
+		if (local_position.timestamp_sample >= _instance[_selected_instance].timestamp_sample_last) {
 			// republish with total reset count and current timestamp
 			local_position.xy_reset_counter = _xy_reset_counter;
 			local_position.z_reset_counter = _z_reset_counter;
@@ -455,7 +487,7 @@ void EKF2Selector::PublishVehicleGlobalPosition(bool reset)
 		_global_position_last = global_position;
 
 		// publish estimator's global position for system (vehicle_global_position) unless it's stale
-		if (global_position.timestamp >= _instance[_selected_instance].estimator_status.timestamp_sample) {
+		if (global_position.timestamp_sample >= _instance[_selected_instance].timestamp_sample_last) {
 			// republish with total reset count and current timestamp
 			global_position.lat_lon_reset_counter = _lat_lon_reset_counter;
 			global_position.alt_reset_counter = _alt_reset_counter;
@@ -467,10 +499,29 @@ void EKF2Selector::PublishVehicleGlobalPosition(bool reset)
 	}
 }
 
+void EKF2Selector::PublishWindEstimate(bool reset)
+{
+	wind_s wind;
+
+	if (_instance[_selected_instance].estimator_wind_sub.copy(&wind)) {
+		if (reset) {
+			// ensure monotonically increasing timestamp_sample through reset
+			wind.timestamp_sample = max(wind.timestamp_sample, _wind_last.timestamp_sample);
+		}
+
+		// save last primary wind
+		_wind_last = wind;
+
+		// republish with current timestamp
+		wind.timestamp = hrt_absolute_time();
+		_wind_pub.publish(wind);
+	}
+}
+
 void EKF2Selector::Run()
 {
 	// re-schedule as backup timeout
-	ScheduleDelayed(10_ms);
+	ScheduleDelayed(FILTER_UPDATE_PERIOD);
 
 	// check for parameter updates
 	if (_parameter_update_sub.updated()) {
@@ -485,11 +536,11 @@ void EKF2Selector::Run()
 	// update combined test ratio for all estimators
 	const bool updated = UpdateErrorScores();
 
-	// if no valid instance selected then select instance with valid IMU
+	// if no valid instance then force select first instance with valid IMU
 	if (_selected_instance == INVALID_INSTANCE) {
 		for (uint8_t i = 0; i < EKF2_MAX_INSTANCES; i++) {
-			if ((_instance[i].estimator_status.accel_device_id != 0)
-			    && (_instance[i].estimator_status.gyro_device_id != 0)) {
+			if ((_instance[i].accel_device_id != 0)
+			    && (_instance[i].gyro_device_id != 0)) {
 
 				if (SelectInstance(i)) {
 					break;
@@ -504,9 +555,19 @@ void EKF2Selector::Run()
 	}
 
 	if (updated) {
+
+		const uint8_t available_instances_prev = _available_instances;
+		const uint8_t selected_instance_prev = _selected_instance;
+		const uint32_t instance_changed_count_prev = _instance_changed_count;
+		const hrt_abstime last_instance_change_prev = _last_instance_change;
+
 		bool lower_error_available = false;
 		float alternative_error = 0.f; // looking for instances that have error lower than the current primary
-		uint8_t best_ekf_instance = _selected_instance;
+		float best_test_ratio = FLT_MAX;
+
+		uint8_t best_ekf = _selected_instance;
+		uint8_t best_ekf_alternate = INVALID_INSTANCE;
+		uint8_t best_ekf_different_imu = INVALID_INSTANCE;
 
 		// loop through all available instances to find if an alternative is available
 		for (int i = 0; i < _available_instances; i++) {
@@ -517,109 +578,115 @@ void EKF2Selector::Run()
 			// OR
 			// selected instance has stopped updating
 			if (_instance[i].healthy && (i != _selected_instance)) {
+				const float test_ratio = _instance[i].combined_test_ratio;
 				const float relative_error = _instance[i].relative_test_ratio;
 
 				if (relative_error < alternative_error) {
-
+					best_ekf_alternate = i;
 					alternative_error = relative_error;
-					best_ekf_instance = i;
 
 					// relative error less than selected instance and has not been the selected instance for at least 10 seconds
 					if ((relative_error <= -_rel_err_thresh) && hrt_elapsed_time(&_instance[i].time_last_selected) > 10_s) {
 						lower_error_available = true;
 					}
 				}
-			}
-		}
 
-		if (!_instance[_selected_instance].healthy && (best_ekf_instance == _selected_instance)) {
-			// force selection to best healthy instance
-			uint8_t best_instance = _selected_instance;
-			float best_test_ratio = FLT_MAX;
+				if ((test_ratio > 0) && (test_ratio < best_test_ratio)) {
+					best_ekf = i;
+					best_test_ratio = test_ratio;
 
-			for (int i = 0; i < _available_instances; i++) {
-				if (_instance[i].healthy) {
-					const float test_ratio = _instance[i].combined_test_ratio;
-
-					if ((test_ratio > 0) && (test_ratio < best_test_ratio)) {
-						best_instance = i;
-						best_test_ratio = test_ratio;
+					// also check next best available ekf using a different IMU
+					if (_instance[i].accel_device_id != _instance[_selected_instance].accel_device_id) {
+						best_ekf_different_imu = i;
 					}
 				}
 			}
+		}
 
-			SelectInstance(best_instance);
-
-		} else if (best_ekf_instance != _selected_instance) {
-			//  if this instance has a significantly lower relative error to the active primary, we consider it as a
-			// better instance and would like to switch to it even if the current primary is healthy
-			//  switch immediately if the current selected is no longer healthy
-			if ((lower_error_available && hrt_elapsed_time(&_last_instance_change) > 10_s)
-			    || !_instance[_selected_instance].healthy) {
-
-				SelectInstance(best_ekf_instance);
+		if (!_instance[_selected_instance].healthy) {
+			// prefer the best healthy instance using a different IMU
+			if (!SelectInstance(best_ekf_different_imu)) {
+				// otherwise switch to the healthy instance with best overall test ratio
+				SelectInstance(best_ekf);
 			}
+
+		} else if (lower_error_available && (hrt_elapsed_time(&_last_instance_change) > 10_s)) {
+			// if this instance has a significantly lower relative error to the active primary, we consider it as a
+			// better instance and would like to switch to it even if the current primary is healthy
+			SelectInstance(best_ekf_alternate);
 		}
 
-		// publish selector status
-		estimator_selector_status_s selector_status{};
-		selector_status.primary_instance = _selected_instance;
-		selector_status.instances_available = _available_instances;
-		selector_status.instance_changed_count = _instance_changed_count;
-		selector_status.last_instance_change = _last_instance_change;
-		selector_status.accel_device_id = _instance[_selected_instance].estimator_status.accel_device_id;
-		selector_status.baro_device_id = _instance[_selected_instance].estimator_status.baro_device_id;
-		selector_status.gyro_device_id = _instance[_selected_instance].estimator_status.gyro_device_id;
-		selector_status.mag_device_id = _instance[_selected_instance].estimator_status.mag_device_id;
-		selector_status.gyro_fault_detected = _gyro_fault_detected;
-		selector_status.accel_fault_detected = _accel_fault_detected;
+		// publish selector status at ~1 Hz or immediately on any change
+		if (_selector_status_publish || (hrt_elapsed_time(&_last_status_publish) > 1_s)
+		    || (available_instances_prev != _available_instances)
+		    || (selected_instance_prev != _selected_instance)
+		    || (instance_changed_count_prev != _instance_changed_count)
+		    || (last_instance_change_prev != _last_instance_change)
+		    || _accel_fault_detected || _gyro_fault_detected) {
 
-		for (int i = 0; i < EKF2_MAX_INSTANCES; i++) {
-			selector_status.combined_test_ratio[i] = _instance[i].combined_test_ratio;
-			selector_status.relative_test_ratio[i] = _instance[i].relative_test_ratio;
-			selector_status.healthy[i] = _instance[i].healthy;
+			estimator_selector_status_s selector_status{};
+			selector_status.primary_instance = _selected_instance;
+			selector_status.instances_available = _available_instances;
+			selector_status.instance_changed_count = _instance_changed_count;
+			selector_status.last_instance_change = _last_instance_change;
+			selector_status.accel_device_id = _instance[_selected_instance].accel_device_id;
+			selector_status.baro_device_id = _instance[_selected_instance].baro_device_id;
+			selector_status.gyro_device_id = _instance[_selected_instance].gyro_device_id;
+			selector_status.mag_device_id = _instance[_selected_instance].mag_device_id;
+			selector_status.gyro_fault_detected = _gyro_fault_detected;
+			selector_status.accel_fault_detected = _accel_fault_detected;
+
+			for (int i = 0; i < EKF2_MAX_INSTANCES; i++) {
+				selector_status.combined_test_ratio[i] = _instance[i].combined_test_ratio;
+				selector_status.relative_test_ratio[i] = _instance[i].relative_test_ratio;
+				selector_status.healthy[i] = _instance[i].healthy;
+			}
+
+			for (int i = 0; i < IMU_STATUS_SIZE; i++) {
+				selector_status.accumulated_gyro_error[i] = _accumulated_gyro_error[i];
+				selector_status.accumulated_accel_error[i] = _accumulated_accel_error[i];
+			}
+
+			selector_status.timestamp = hrt_absolute_time();
+			_estimator_selector_status_pub.publish(selector_status);
+			_last_status_publish = selector_status.timestamp;
+			_selector_status_publish = false;
 		}
-
-		for (int i = 0; i < IMU_STATUS_SIZE; i++) {
-			selector_status.accumulated_gyro_error[i] = _accumulated_gyro_error[i];
-			selector_status.accumulated_accel_error[i] = _accumulated_accel_error[i];
-		}
-
-		selector_status.timestamp = hrt_absolute_time();
-		_estimator_selector_status_pub.publish(selector_status);
 	}
 
 	// republish selected estimator data for system
-	if (_selected_instance != INVALID_INSTANCE) {
-		// selected estimator_attitude -> vehicle_attitude
-		if (_instance[_selected_instance].estimator_attitude_sub.updated()) {
-			PublishVehicleAttitude();
-		}
 
-		// selected estimator_local_position -> vehicle_local_position
-		if (_instance[_selected_instance].estimator_local_position_sub.updated()) {
-			PublishVehicleLocalPosition();
-		}
+	// selected estimator_attitude -> vehicle_attitude
+	if (_instance[_selected_instance].estimator_attitude_sub.updated()) {
+		PublishVehicleAttitude();
+	}
 
-		// selected estimator_global_position -> vehicle_global_position
-		if (_instance[_selected_instance].estimator_global_position_sub.updated()) {
-			PublishVehicleGlobalPosition();
-		}
+	// selected estimator_local_position -> vehicle_local_position
+	if (_instance[_selected_instance].estimator_local_position_sub.updated()) {
+		PublishVehicleLocalPosition();
+	}
 
-		// selected estimator_odometry -> vehicle_odometry
-		if (_instance[_selected_instance].estimator_odometry_sub.updated()) {
-			vehicle_odometry_s vehicle_odometry;
+	// selected estimator_global_position -> vehicle_global_position
+	if (_instance[_selected_instance].estimator_global_position_sub.updated()) {
+		PublishVehicleGlobalPosition();
+	}
 
-			if (_instance[_selected_instance].estimator_odometry_sub.update(&vehicle_odometry)) {
-				if (vehicle_odometry.timestamp >= _instance[_selected_instance].estimator_status.timestamp_sample) {
-					vehicle_odometry.timestamp = hrt_absolute_time();
-					_vehicle_odometry_pub.publish(vehicle_odometry);
-				}
+	// selected estimator_wind -> wind
+	if (_instance[_selected_instance].estimator_wind_sub.updated()) {
+		PublishWindEstimate();
+	}
+
+	// selected estimator_odometry -> vehicle_odometry
+	if (_instance[_selected_instance].estimator_odometry_sub.updated()) {
+		vehicle_odometry_s vehicle_odometry;
+
+		if (_instance[_selected_instance].estimator_odometry_sub.update(&vehicle_odometry)) {
+			if (vehicle_odometry.timestamp_sample >= _instance[_selected_instance].timestamp_sample_last) {
+				vehicle_odometry.timestamp = hrt_absolute_time();
+				_vehicle_odometry_pub.publish(vehicle_odometry);
 			}
 		}
 	}
-
-	px4_lockstep_progress(_lockstep_component);
 }
 
 void EKF2Selector::PrintStatus()
@@ -634,8 +701,7 @@ void EKF2Selector::PrintStatus()
 		const EstimatorInstance &inst = _instance[i];
 
 		PX4_INFO("%d: ACC: %d, GYRO: %d, MAG: %d, %s, test ratio: %.7f (%.5f) %s",
-			 inst.instance, inst.estimator_status.accel_device_id, inst.estimator_status.gyro_device_id,
-			 inst.estimator_status.mag_device_id,
+			 inst.instance, inst.accel_device_id, inst.gyro_device_id, inst.mag_device_id,
 			 inst.healthy ? "healthy" : "unhealthy",
 			 (double)inst.combined_test_ratio, (double)inst.relative_test_ratio,
 			 (_selected_instance == i) ? "*" : "");
